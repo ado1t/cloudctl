@@ -1,0 +1,14 @@
+zones:
+  - zone: example1.com
+    records:
+      - type: CNAME
+        name: _c93b9a33d8bde7910f5e9680040b841c
+        content: _b8139bafb2693c648b1924f573c465d8.jkddzztszm.acm-validations.aws
+        proxied: false
+
+  - zone: example2.com
+    records:
+      - type: CNAME
+        name: _c93b9a33d8bde7910f5e9680040b842c
+        content: _b8139bafb2693c648b1924f573c465d2.jkddzztszm.acm-validations.aws
+        proxied: false

@@ -1,0 +1,15 @@
+# ACM 证书批量申请配置示例
+# 使用方法: cloudctl aws cert request --config certificates.yaml
+
+certificates:
+  # 单域名证书
+  - domain: 55rainbow.com
+    san:
+      - 55rainbow.com
+      - "*.55rainbow.com"
+  
+  # 多域名证书
+  - domain: 56rainbow.cn
+    san:
+      - "*.56rainbow.cn"
+      - www.56rainbow.cn

@@ -1,0 +1,38 @@
+# DNS 记录批量创建配置示例
+# 使用方法: cloudctl cf dns create --config dns-records.yaml
+
+# 支持多个 zone，每个 zone 可以有多个 DNS 记录
+zones:
+  # 第一个域名
+  - zone: example4.com
+    records:
+      # A 记录 - 指向 IPv4 地址
+      - type: A
+        name: www
+        content: 1.2.3.4
+        proxied: true
+      
+      - type: A
+        name: "@"  # 根域名
+        content: 1.2.3.4
+        proxied: true
+      
+      # CNAME 记录 - 指向其他域名
+      - type: CNAME
+        name: blog
+        content: example1.com
+        proxied: true
+  
+  # 第二个域名
+  - zone: example5.com
+    records:
+      - type: A
+        name: www
+        content: 2.3.4.5
+        proxied: true
+      
+      - type: CNAME
+        name: cdn
+        content: "d2222222222222.cloudfront.net"
+        #ttl: 3600
+        proxied: false
