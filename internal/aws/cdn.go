@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
 
@@ -526,4 +527,338 @@ func safeTime(t *time.Time) time.Time {
 		return time.Time{}
 	}
 	return *t
+}
+
+// DistributionsConfig CloudFront 分发批量创建配置
+type DistributionsConfig struct {
+	Distributions []DistributionConfig `yaml:"distributions"`
+}
+
+// DistributionConfig 单个分发配置
+type DistributionConfig struct {
+	Name           string           `yaml:"name"`
+	Aliases        []string         `yaml:"aliases"`
+	CertificateARN string           `yaml:"certificate_arn"`
+	WafARN         string           `yaml:"waf_arn"` // 可选
+	Origin         OriginConfig     `yaml:"origin"`
+	Behaviors      []BehaviorConfig `yaml:"behaviors"`
+}
+
+// OriginConfig 源配置
+type OriginConfig struct {
+	Domain string `yaml:"domain"`
+}
+
+// BehaviorConfig 缓存行为配置
+type BehaviorConfig struct {
+	Priority              int    `yaml:"priority"`
+	PathPattern           string `yaml:"path_pattern"`
+	ViewerProtocolPolicy  string `yaml:"viewer_protocol_policy"`
+	CachePolicy           string `yaml:"cache_policy"`
+	OriginRequestPolicy   string `yaml:"origin_request_policy"`
+	ResponseHeadersPolicy string `yaml:"response_headers_policy"`
+}
+
+// AWS CloudFront 托管策略 ID 映射
+var (
+	CachePolicyIDs = map[string]string{
+		"Managed-CachingDisabled":  "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+		"Managed-CachingOptimized": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+	}
+
+	OriginRequestPolicyIDs = map[string]string{
+		"Managed-AllViewer": "216adef6-5c7f-47e4-b989-5492eafa07d3",
+	}
+
+	ResponseHeadersPolicyIDs = map[string]string{
+		"Managed-SimpleCORS": "60669652-455b-4ae9-85a4-c4c02393f86c",
+	}
+)
+
+// DistributionCreateResult 单个分发创建结果
+type DistributionCreateResult struct {
+	Name           string
+	Success        bool
+	DistributionID string
+	DomainName     string
+	Error          string
+}
+
+// BatchCreateResult 批量创建结果
+type BatchCreateResult struct {
+	Total   int
+	Success int
+	Failed  int
+	Results []DistributionCreateResult
+}
+
+// ValidateCertificates 验证所有证书状态是否为 ISSUED
+func (c *Client) ValidateCertificates(ctx context.Context, certificateARNs []string) error {
+	logger.Debug("验证证书状态", "count", len(certificateARNs))
+
+	for _, arn := range certificateARNs {
+		if arn == "" {
+			continue
+		}
+
+		cert, err := c.GetCertificate(ctx, arn)
+		if err != nil {
+			return fmt.Errorf("获取证书失败 %s: %w", arn, err)
+		}
+
+		if cert.Status != "ISSUED" {
+			return fmt.Errorf("证书 %s 状态不是 ISSUED，当前状态: %s", arn, cert.Status)
+		}
+
+		logger.Info("证书验证通过", "arn", arn, "status", cert.Status)
+	}
+
+	logger.Info("所有证书验证通过", "count", len(certificateARNs))
+	return nil
+}
+
+// CreateDistributionWithConfig 创建 CloudFront 分发（使用配置结构）
+func (c *Client) CreateDistributionWithConfig(ctx context.Context, config DistributionConfig) (*DistributionCreateResult, error) {
+	logger.Debug("开始创建 CloudFront 分发", "name", config.Name)
+
+	// 生成唯一的调用者引用
+	callerReference := fmt.Sprintf("%s-%d", config.Name, time.Now().Unix())
+
+	// 构建源配置
+	originID := fmt.Sprintf("%s-origin", config.Name)
+	origin := &types.Origin{
+		Id:         &originID,
+		DomainName: &config.Origin.Domain,
+		CustomOriginConfig: &types.CustomOriginConfig{
+			HTTPPort:             aws.Int32(80),
+			HTTPSPort:            aws.Int32(443),
+			OriginProtocolPolicy: types.OriginProtocolPolicyHttpOnly, // 使用 HTTP
+			OriginSslProtocols: &types.OriginSslProtocols{
+				Items:    []types.SslProtocol{types.SslProtocolTLSv12},
+				Quantity: aws.Int32(1),
+			},
+		},
+	}
+
+	// 构建缓存行为
+	cacheBehaviors, defaultBehavior, err := c.buildCacheBehaviors(config.Behaviors, originID)
+	if err != nil {
+		return nil, fmt.Errorf("构建缓存行为失败: %w", err)
+	}
+
+	// 构建分发配置
+	distributionConfig := &types.DistributionConfig{
+		CallerReference: &callerReference,
+		Comment:         aws.String(config.Name),
+		Enabled:         aws.Bool(true),
+		Origins: &types.Origins{
+			Items:    []types.Origin{*origin},
+			Quantity: aws.Int32(1),
+		},
+		DefaultCacheBehavior: defaultBehavior,
+		Aliases: &types.Aliases{
+			Items:    config.Aliases,
+			Quantity: aws.Int32(int32(len(config.Aliases))),
+		},
+		ViewerCertificate: &types.ViewerCertificate{
+			ACMCertificateArn:      &config.CertificateARN,
+			SSLSupportMethod:       types.SSLSupportMethodSniOnly,
+			MinimumProtocolVersion: types.MinimumProtocolVersion("TLSv1.2_2021"),
+		},
+	}
+
+	// 添加额外的缓存行为（如果有）
+	if len(cacheBehaviors) > 0 {
+		distributionConfig.CacheBehaviors = &types.CacheBehaviors{
+			Items:    cacheBehaviors,
+			Quantity: aws.Int32(int32(len(cacheBehaviors))),
+		}
+	}
+
+	// 添加 WAF（如果配置）
+	if config.WafARN != "" {
+		distributionConfig.WebACLId = &config.WafARN
+	}
+
+	// 创建分发
+	input := &cloudfront.CreateDistributionInput{
+		DistributionConfig: distributionConfig,
+	}
+
+	output, err := c.cloudfrontClient.CreateDistribution(ctx, input)
+	if err != nil {
+		return &DistributionCreateResult{
+			Name:    config.Name,
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// 添加 Name 标签
+	// CloudFront 分发的 ARN 格式：arn:aws:cloudfront::account-id:distribution/distribution-id
+	distributionARN := *output.Distribution.ARN
+	tagInput := &cloudfront.TagResourceInput{
+		Resource: &distributionARN,
+		Tags: &types.Tags{
+			Items: []types.Tag{
+				{
+					Key:   aws.String("Name"),
+					Value: aws.String(config.Name),
+				},
+			},
+		},
+	}
+
+	if _, err := c.cloudfrontClient.TagResource(ctx, tagInput); err != nil {
+		logger.Warn("添加标签失败", "distribution_id", *output.Distribution.Id, "error", err)
+		// 标签失败不影响分发创建成功
+	}
+
+	result := &DistributionCreateResult{
+		Name:           config.Name,
+		Success:        true,
+		DistributionID: *output.Distribution.Id,
+		DomainName:     *output.Distribution.DomainName,
+	}
+
+	logger.Info("成功创建 CloudFront 分发",
+		"name", config.Name,
+		"id", result.DistributionID,
+		"domain", result.DomainName)
+
+	return result, nil
+}
+
+// buildCacheBehaviors 构建缓存行为配置
+func (c *Client) buildCacheBehaviors(behaviors []BehaviorConfig, originID string) ([]types.CacheBehavior, *types.DefaultCacheBehavior, error) {
+	if len(behaviors) == 0 {
+		return nil, nil, fmt.Errorf("至少需要一个缓存行为配置")
+	}
+
+	var cacheBehaviors []types.CacheBehavior
+	var defaultBehavior *types.DefaultCacheBehavior
+
+	for _, behavior := range behaviors {
+		// 解析策略 ID
+		cachePolicyID, err := c.resolvePolicyID(behavior.CachePolicy, CachePolicyIDs)
+		if err != nil {
+			return nil, nil, fmt.Errorf("解析缓存策略失败: %w", err)
+		}
+
+		originRequestPolicyID, err := c.resolvePolicyID(behavior.OriginRequestPolicy, OriginRequestPolicyIDs)
+		if err != nil {
+			return nil, nil, fmt.Errorf("解析源请求策略失败: %w", err)
+		}
+
+		responseHeadersPolicyID, err := c.resolvePolicyID(behavior.ResponseHeadersPolicy, ResponseHeadersPolicyIDs)
+		if err != nil {
+			return nil, nil, fmt.Errorf("解析响应头策略失败: %w", err)
+		}
+
+		// 解析 Viewer Protocol Policy
+		viewerProtocolPolicy, err := c.parseViewerProtocolPolicy(behavior.ViewerProtocolPolicy)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// 优先级 1 且路径为 "*" 的是默认行为
+		if behavior.Priority == 1 && behavior.PathPattern == "*" {
+			defaultBehavior = &types.DefaultCacheBehavior{
+				TargetOriginId:          &originID,
+				ViewerProtocolPolicy:    viewerProtocolPolicy,
+				CachePolicyId:           &cachePolicyID,
+				OriginRequestPolicyId:   &originRequestPolicyID,
+				ResponseHeadersPolicyId: &responseHeadersPolicyID,
+				Compress:                aws.Bool(true),
+				AllowedMethods: &types.AllowedMethods{
+					Items:    []types.Method{types.MethodGet, types.MethodHead, types.MethodOptions, types.MethodPut, types.MethodPost, types.MethodPatch, types.MethodDelete},
+					Quantity: aws.Int32(7),
+					CachedMethods: &types.CachedMethods{
+						Items:    []types.Method{types.MethodGet, types.MethodHead},
+						Quantity: aws.Int32(2),
+					},
+				},
+			}
+		} else {
+			// 其他的作为额外的缓存行为
+			cacheBehavior := types.CacheBehavior{
+				PathPattern:             &behavior.PathPattern,
+				TargetOriginId:          &originID,
+				ViewerProtocolPolicy:    viewerProtocolPolicy,
+				CachePolicyId:           &cachePolicyID,
+				OriginRequestPolicyId:   &originRequestPolicyID,
+				ResponseHeadersPolicyId: &responseHeadersPolicyID,
+				Compress:                aws.Bool(true),
+				AllowedMethods: &types.AllowedMethods{
+					Items:    []types.Method{types.MethodGet, types.MethodHead, types.MethodOptions, types.MethodPut, types.MethodPost, types.MethodPatch, types.MethodDelete},
+					Quantity: aws.Int32(7),
+					CachedMethods: &types.CachedMethods{
+						Items:    []types.Method{types.MethodGet, types.MethodHead},
+						Quantity: aws.Int32(2),
+					},
+				},
+			}
+			cacheBehaviors = append(cacheBehaviors, cacheBehavior)
+		}
+	}
+
+	if defaultBehavior == nil {
+		return nil, nil, fmt.Errorf("未找到默认缓存行为（priority=1, path_pattern='*'）")
+	}
+
+	return cacheBehaviors, defaultBehavior, nil
+}
+
+// resolvePolicyID 解析策略 ID
+func (c *Client) resolvePolicyID(policyName string, policyMap map[string]string) (string, error) {
+	if policyID, ok := policyMap[policyName]; ok {
+		return policyID, nil
+	}
+	// 如果不在映射表中，假设直接提供的是 ID
+	return policyName, nil
+}
+
+// parseViewerProtocolPolicy 解析 Viewer Protocol Policy
+func (c *Client) parseViewerProtocolPolicy(policy string) (types.ViewerProtocolPolicy, error) {
+	switch policy {
+	case "redirect-to-https":
+		return types.ViewerProtocolPolicyRedirectToHttps, nil
+	case "allow-all":
+		return types.ViewerProtocolPolicyAllowAll, nil
+	case "https-only":
+		return types.ViewerProtocolPolicyHttpsOnly, nil
+	default:
+		return "", fmt.Errorf("不支持的 viewer protocol policy: %s", policy)
+	}
+}
+
+// BatchCreateDistributions 批量创建 CloudFront 分发
+func (c *Client) BatchCreateDistributions(ctx context.Context, configs []DistributionConfig) *BatchCreateResult {
+	logger.Debug("批量创建 CloudFront 分发", "count", len(configs))
+
+	result := &BatchCreateResult{
+		Total:   len(configs),
+		Results: make([]DistributionCreateResult, 0, len(configs)),
+	}
+
+	for i, config := range configs {
+		logger.Info("创建分发", "progress", fmt.Sprintf("%d/%d", i+1, len(configs)), "name", config.Name)
+
+		distResult, err := c.CreateDistributionWithConfig(ctx, config)
+		if err != nil {
+			logger.Error("创建分发失败", "name", config.Name, "error", err)
+			result.Failed++
+			if distResult != nil {
+				result.Results = append(result.Results, *distResult)
+			}
+			continue
+		}
+
+		result.Success++
+		result.Results = append(result.Results, *distResult)
+		logger.Info("成功创建分发", "name", config.Name, "id", distResult.DistributionID)
+	}
+
+	logger.Info("批量创建完成", "total", result.Total, "success", result.Success, "failed", result.Failed)
+	return result
 }

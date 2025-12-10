@@ -3,9 +3,11 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ado1t/cloudctl/internal/aws"
 	"github.com/ado1t/cloudctl/internal/logger"
@@ -20,6 +22,7 @@ var (
 
 	// CDN Create 参数
 	cdnCreateProfile           string
+	cdnCreateConfigFile        string
 	cdnCreateOrigin            string
 	cdnCreateAliases           []string
 	cdnCreateComment           string
@@ -59,14 +62,14 @@ func init() {
 
 	// CDN Create 命令参数
 	cdnCreateCmd.Flags().StringVarP(&cdnCreateProfile, "profile", "p", "", "使用指定的 AWS profile")
-	cdnCreateCmd.Flags().StringVar(&cdnCreateOrigin, "origin", "", "源站域名（必需）")
+	cdnCreateCmd.Flags().StringVarP(&cdnCreateConfigFile, "config", "f", "", "批量创建配置文件（YAML 格式）")
+	cdnCreateCmd.Flags().StringVar(&cdnCreateOrigin, "origin", "", "源站域名（单个创建时必需）")
 	cdnCreateCmd.Flags().StringSliceVarP(&cdnCreateAliases, "aliases", "a", []string{}, "自定义域名（可选，多个用逗号分隔）")
 	cdnCreateCmd.Flags().StringVar(&cdnCreateComment, "comment", "", "备注说明（可选）")
 	cdnCreateCmd.Flags().BoolVar(&cdnCreateEnabled, "enabled", true, "是否启用分发（默认: true）")
 	cdnCreateCmd.Flags().StringVar(&cdnCreateCertificateARN, "certificate-arn", "", "SSL 证书 ARN（可选，使用自定义域名时需要）")
 	cdnCreateCmd.Flags().StringVar(&cdnCreatePriceClass, "price-class", "", "价格等级（可选: PriceClass_100, PriceClass_200, PriceClass_All）")
 	cdnCreateCmd.Flags().StringVar(&cdnCreateDefaultRootObject, "default-root-object", "", "默认根对象（可选，如: index.html）")
-	cdnCreateCmd.MarkFlagRequired("origin")
 
 	// CDN Update 命令参数
 	cdnUpdateCmd.Flags().StringVarP(&cdnUpdateProfile, "profile", "p", "", "使用指定的 AWS profile")
@@ -114,9 +117,12 @@ var cdnGetCmd = &cobra.Command{
 var cdnCreateCmd = &cobra.Command{
 	Use:   "create",
 	Short: "创建 CloudFront 分发",
-	Long: `创建新的 CloudFront 分发。
+	Long: `创建新的 CloudFront 分发。支持单个创建或批量创建。
 
 使用示例:
+  # 批量创建（使用配置文件）
+  cloudctl aws cdn create --config cdn-distributions.yaml
+
   # 创建基本分发
   cloudctl aws cdn create --origin example.com
 
@@ -259,20 +265,25 @@ func runCdnGet(cmd *cobra.Command, args []string) error {
 func runCdnCreate(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	// 验证参数
+	// 创建 AWS 客户端
+	client, err := aws.NewClient(cdnCreateProfile)
+	if err != nil {
+		return fmt.Errorf("创建 AWS 客户端失败: %w", err)
+	}
+
+	// 判断是批量创建还是单个创建
+	if cdnCreateConfigFile != "" {
+		return runBatchCdnCreate(ctx, client)
+	}
+
+	// 单个创建 - 验证参数
 	if cdnCreateOrigin == "" {
-		return fmt.Errorf("必须指定源站域名 (--origin)")
+		return fmt.Errorf("必须指定源站域名 (--origin) 或配置文件 (-f/--config)")
 	}
 
 	// 如果有自定义域名但没有证书，给出警告
 	if len(cdnCreateAliases) > 0 && cdnCreateCertificateARN == "" {
 		logger.Warn("使用自定义域名时建议配置 SSL 证书 (--certificate-arn)")
-	}
-
-	// 创建 AWS 客户端
-	client, err := aws.NewClient(cdnCreateProfile)
-	if err != nil {
-		return fmt.Errorf("创建 AWS 客户端失败: %w", err)
 	}
 
 	logger.Info("正在创建 CloudFront 分发...", "origin", cdnCreateOrigin)
@@ -540,6 +551,99 @@ func runCdnInvalidateStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("✓ 缓存失效已完成\n")
 	default:
 		fmt.Printf("状态: %s\n", invalidation.Status)
+	}
+
+	return nil
+}
+
+// runBatchCdnCreate 执行批量 CloudFront 分发创建
+func runBatchCdnCreate(ctx context.Context, client *aws.Client) error {
+	logger.Info("正在读取配置文件...", "file", cdnCreateConfigFile)
+
+	// 读取配置文件
+	data, err := os.ReadFile(cdnCreateConfigFile)
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	// 解析配置
+	var config aws.DistributionsConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("解析配置文件失败: %w", err)
+	}
+
+	if len(config.Distributions) == 0 {
+		return fmt.Errorf("配置文件中没有分发配置")
+	}
+
+	logger.Info("开始批量创建 CloudFront 分发", "count", len(config.Distributions))
+
+	// 提取所有证书 ARN 进行验证
+	var certificateARNs []string
+	for _, dist := range config.Distributions {
+		if dist.CertificateARN != "" {
+			certificateARNs = append(certificateARNs, dist.CertificateARN)
+		}
+	}
+
+	// 验证所有证书状态
+	if len(certificateARNs) > 0 {
+		logger.Info("验证证书状态...", "count", len(certificateARNs))
+		fmt.Printf("\n验证 %d 个证书状态...\n", len(certificateARNs))
+
+		if err := client.ValidateCertificates(ctx, certificateARNs); err != nil {
+			return fmt.Errorf("证书验证失败，停止执行: %w", err)
+		}
+
+		fmt.Printf("✓ 所有证书验证通过\n\n")
+	}
+
+	// 批量创建
+	fmt.Printf("开始批量创建 %d 个 CloudFront 分发...\n\n", len(config.Distributions))
+	result := client.BatchCreateDistributions(ctx, config.Distributions)
+
+	// 显示结果
+	separator := strings.Repeat("=", 60)
+	fmt.Printf("\n%s\n", separator)
+	fmt.Printf("批量创建完成\n")
+	fmt.Printf("%s\n\n", separator)
+	fmt.Printf("总计: %d\n", result.Total)
+	fmt.Printf("成功: %d\n", result.Success)
+	fmt.Printf("失败: %d\n\n", result.Failed)
+
+	// 显示详细结果
+	if result.Success > 0 {
+		line := strings.Repeat("-", 60)
+		fmt.Printf("成功的分发:\n")
+		fmt.Printf("%s\n", line)
+		for _, r := range result.Results {
+			if r.Success {
+				fmt.Printf("✓ %s\n", r.Name)
+				fmt.Printf("  ID: %s\n", r.DistributionID)
+				fmt.Printf("  域名: %s\n\n", r.DomainName)
+			}
+		}
+	}
+
+	if result.Failed > 0 {
+		line := strings.Repeat("-", 60)
+		fmt.Printf("失败的分发:\n")
+		fmt.Printf("%s\n", line)
+		for _, r := range result.Results {
+			if !r.Success {
+				fmt.Printf("✗ %s\n", r.Name)
+				fmt.Printf("  错误: %s\n\n", r.Error)
+			}
+		}
+	}
+
+	fmt.Printf("\n注意: CloudFront 分发部署通常需要 10-15 分钟\n")
+	fmt.Printf("可以使用以下命令查看所有分发:\n")
+	fmt.Printf("  cloudctl aws cdn list\n")
+
+	// 如果有失败的，返回错误
+	if result.Failed > 0 {
+		return fmt.Errorf("有 %d 个分发创建失败", result.Failed)
 	}
 
 	return nil

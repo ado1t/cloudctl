@@ -1,0 +1,38 @@
+# CloudFront 分发批量创建配置示例
+# 使用方法: cloudctl aws cdn create --config cdn-distributions.yaml
+
+distributions:
+  # 示例 1: 完整配置
+  - name: example1.com
+    # 备用域名（别名）
+    aliases:
+      - example1.com
+      - www.example1.com
+
+    # ACM 证书 ARN（必需，证书必须在 us-east-1 区域且状态为 ISSUED）
+    certificate_arn: arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012
+
+    # WAF ARN（可选）
+    waf_arn: arn:aws:wafv2:us-east-1:123456789012:global/webacl/example/a1b2c3d4-5678-90ab-cdef-EXAMPLE11111
+
+    # 源配置（使用 HTTP 协议）
+    origin:
+      domain: prod-web-749459849.ap-east-1.elb.amazonaws.com
+
+    # 缓存行为
+    behaviors:
+      # 优先级 0 - API 路径
+      - priority: 0
+        path_pattern: /app-api/*
+        viewer_protocol_policy: redirect-to-https
+        cache_policy: Managed-CachingDisabled
+        origin_request_policy: Managed-AllViewer
+        response_headers_policy: Managed-SimpleCORS
+
+      # 优先级 1 - 默认行为
+      - priority: 1
+        path_pattern: "*"
+        viewer_protocol_policy: redirect-to-https
+        cache_policy: Managed-CachingOptimized
+        origin_request_policy: Managed-AllViewer
+        response_headers_policy: Managed-SimpleCORS

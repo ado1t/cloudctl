@@ -2,7 +2,7 @@
 
 # 变量定义
 BINARY_NAME=cloudctl
-VERSION?=0.1.5
+VERSION?=0.2.0
 BUILD_DIR=_output
 MAIN_PATH=./cmd/cloudctl
 GO=go
